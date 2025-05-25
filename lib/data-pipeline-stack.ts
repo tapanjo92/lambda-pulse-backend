@@ -1,24 +1,30 @@
 import * as cdk from 'aws-cdk-lib';
-import { Duration, StackProps as CdkStackProps } from 'aws-cdk-lib'; // Renamed to CdkStackProps to avoid conflict
+import { Duration, StackProps as CdkStackProps } from 'aws-cdk-lib'; // Renamed to CdkStackProps
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodejs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
+import * as events from 'aws-cdk-lib/aws-events'; // For EventBridge
+import * as eventTargets from 'aws-cdk-lib/aws-events-targets'; // For EventBridge Lambda target
 import { Construct } from 'constructs';
 import * as path from 'path';
 
 // Interface for props expected by this stack
-export interface DataPipelineStackProps extends CdkStackProps { // Using CdkStackProps
+export interface DataPipelineStackProps extends CdkStackProps {
   coldStartDataTableName: string;
   coldStartDataTableArn: string;
+  tenantConfigTableName: string;  // Added for Orchestrator Lambda
+  tenantConfigTableArn: string;   // Added for Orchestrator Lambda
 }
 
 /**
  * Deploys:
- * - LambdaPulseIngestionDLQ   (standard queue)
+ * - LambdaPulseIngestionDLQ (standard queue)
  * - LambdaPulseIngestionQueue (standard queue, wired to the DLQ)
  * - LambdaPulseProcessingFunction (Lambda to process SQS messages and write to DynamoDB)
+ * - LambdaPulseOrchestratorFunction (Lambda to simulate data fetching and send to SQS)
+ * - EventBridge rule to schedule the Orchestrator Lambda
  *
  * Outputs URLs, ARNs, and names for relevant resources.
  */
@@ -26,8 +32,9 @@ export class DataPipelineStack extends cdk.Stack {
   public readonly ingestionQueue: sqs.Queue;
   public readonly deadLetterQueue: sqs.Queue;
   public readonly processingLambda: lambdaNodejs.NodejsFunction;
+  public readonly orchestratorLambda: lambdaNodejs.NodejsFunction; // Added for Orchestrator
 
-  constructor(scope: Construct, id: string, props: DataPipelineStackProps) { // Expecting DataPipelineStackProps
+  constructor(scope: Construct, id: string, props: DataPipelineStackProps) {
     super(scope, id, props);
 
     /* ------------------------------------------------------------------------
@@ -58,41 +65,78 @@ export class DataPipelineStack extends cdk.Stack {
      * --------------------------------------------------------------------- */
     this.processingLambda = new lambdaNodejs.NodejsFunction(this, 'LambdaPulseProcessingFunction', {
       functionName: 'LambdaPulse-ProcessColdStarts', // Optional: define a specific name
-      runtime: lambda.Runtime.NODEJS_LATEST, // Or specific like NODEJS_20_X
-      entry: 'src/lambdas/processing-lambda/index.ts', // Path to your Lambda code
-      handler: 'handler', // The exported function name in your Lambda code
-      timeout: Duration.seconds(60), // Adjust as needed, ensure SQS visibility timeout is longer
-      memorySize: 256, // Adjust as needed
+      runtime: lambda.Runtime.NODEJS_LATEST,
+      entry: path.join(__dirname, '../../src/lambdas/processing-lambda/index.ts'), // Corrected path
+      handler: 'handler',
+      timeout: Duration.seconds(60),
+      memorySize: 256,
       environment: {
         COLD_START_DATA_TABLE_NAME: props.coldStartDataTableName,
-        // Add other necessary environment variables here (e.g., LOG_LEVEL)
       },
       bundling: {
         minify: false,
         sourceMap: true,
-        externalModules: ['@aws-sdk/*'], // Exclude AWS SDK v3 modules from bundle, use Lambda's provided SDK
+        externalModules: ['@aws-sdk/*'], // Exclude AWS SDK v3 from bundle
       },
     });
 
-    // Grant the Lambda permission to consume messages from the SQS queue
-    // This also sets up the SQS queue as an event source for the Lambda
+    // Grant Processing Lambda permission to consume from SQS and set up event source
     this.processingLambda.addEventSource(new SqsEventSource(this.ingestionQueue, {
-      batchSize: 5, // Number of messages to pull in one go. Max 10 for standard queues.
-      // maxBatchingWindow: Duration.minutes(1), // Optional: Max time to gather messages before invoking.
-      // reportBatchItemFailures: true, // Recommended for more granular error handling with SQS
+      batchSize: 5,
+      // reportBatchItemFailures: true, // Recommended for granular error handling
     }));
 
-    // Grant the Lambda permission to write to the ColdStartData DynamoDB table
+    // Grant Processing Lambda permission to write to ColdStartData DynamoDB table
     this.processingLambda.addToRolePolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
-      actions: ['dynamodb:PutItem', 'dynamodb:UpdateItem'], // Add other actions if needed (e.g., BatchWriteItem)
+      actions: ['dynamodb:PutItem', 'dynamodb:UpdateItem'],
       resources: [props.coldStartDataTableArn],
     }));
 
     /* ------------------------------------------------------------------------
-     * 4. CloudFormation outputs
+     * 4. Orchestrator Lambda Function
      * --------------------------------------------------------------------- */
-    new cdk.CfnOutput(this, 'IngestionQueueUrlOutput', { // Made output names more unique
+    this.orchestratorLambda = new lambdaNodejs.NodejsFunction(this, 'LambdaPulseOrchestratorFunction', {
+      functionName: 'LambdaPulse-OrchestrateDataFetch', // Optional: define a specific name
+      runtime: lambda.Runtime.NODEJS_LATEST,
+      entry: 'src/lambdas/processing-lambda/index.ts',
+      handler: 'handler',
+      timeout: Duration.minutes(1), // Can be shorter if just sending SQS messages
+      memorySize: 256,
+      environment: {
+        TENANT_CONFIG_TABLE_NAME: props.tenantConfigTableName,
+        INGESTION_SQS_QUEUE_URL: this.ingestionQueue.queueUrl,
+      },
+      bundling: {
+        minify: false,
+        sourceMap: true,
+        externalModules: ['@aws-sdk/*'], // Exclude AWS SDK v3 from bundle
+      },
+    });
+
+    // Grant Orchestrator Lambda permission to read from TenantConfigTable
+    this.orchestratorLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['dynamodb:Scan', 'dynamodb:Query'], // Query might be useful later
+      resources: [props.tenantConfigTableArn],
+    }));
+
+    // Grant Orchestrator Lambda permission to send messages to the Ingestion SQS queue
+    this.ingestionQueue.grantSendMessages(this.orchestratorLambda);
+
+    // Schedule the Orchestrator Lambda to run periodically
+    const scheduleRule = new events.Rule(this, 'OrchestratorScheduleRule', {
+      ruleName: 'LambdaPulse-OrchestratorSchedule', // Optional: define a specific name
+      schedule: events.Schedule.rate(Duration.minutes(15)), // Run every 15 minutes
+      // For testing, you might use Duration.minutes(2) or similar
+    });
+    scheduleRule.addTarget(new eventTargets.LambdaFunction(this.orchestratorLambda));
+
+
+    /* ------------------------------------------------------------------------
+     * 5. CloudFormation outputs
+     * --------------------------------------------------------------------- */
+    new cdk.CfnOutput(this, 'IngestionQueueUrlOutput', {
       value: this.ingestionQueue.queueUrl,
     });
     new cdk.CfnOutput(this, 'IngestionQueueArnOutput', {
@@ -105,10 +149,19 @@ export class DataPipelineStack extends cdk.Stack {
       value: this.deadLetterQueue.queueArn,
     });
     new cdk.CfnOutput(this, 'ProcessingLambdaNameOutput', {
-        value: this.processingLambda.functionName,
+      value: this.processingLambda.functionName,
     });
     new cdk.CfnOutput(this, 'ProcessingLambdaArnOutput', {
-        value: this.processingLambda.functionArn,
+      value: this.processingLambda.functionArn,
+    });
+    new cdk.CfnOutput(this, 'OrchestratorLambdaNameOutput', { // Added for Orchestrator
+        value: this.orchestratorLambda.functionName,
+    });
+    new cdk.CfnOutput(this, 'OrchestratorLambdaArnOutput', { // Added for Orchestrator
+        value: this.orchestratorLambda.functionArn,
+    });
+    new cdk.CfnOutput(this, 'OrchestratorScheduleRuleNameOutput', { // Added for Schedule Rule
+        value: scheduleRule.ruleName,
     });
   }
 }
