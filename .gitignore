@@ -1,8 +1,24 @@
-*.js
-!jest.config.js
-*.d.ts
-node_modules
-
 # CDK asset staging directory
 .cdk.staging
-cdk.out
+cdk.out/
+
+# Folders containing sensitive information or too large to track
+node_modules/
+coverage/
+dist/
+
+# IDE and OS specific files
+.DS_Store
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Environment variable files
+.env
+*.env
+
+# CDK Context
+cdk.context.json # Good to ignore if it contains account-specific context
