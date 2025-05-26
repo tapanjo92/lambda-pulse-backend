@@ -66,7 +66,7 @@ export class DataPipelineStack extends cdk.Stack {
     this.processingLambda = new lambdaNodejs.NodejsFunction(this, 'LambdaPulseProcessingFunction', {
       functionName: 'LambdaPulse-ProcessColdStarts', // Optional: define a specific name
       runtime: lambda.Runtime.NODEJS_LATEST,
-      entry: path.join(__dirname, '../../src/lambdas/processing-lambda/index.ts'), // Corrected path
+      entry: path.join(__dirname, '..', 'src', 'lambdas', 'processing-lambda', 'index.ts'), // Corrected path
       handler: 'handler',
       timeout: Duration.seconds(60),
       memorySize: 256,
@@ -96,12 +96,17 @@ export class DataPipelineStack extends cdk.Stack {
     /* ------------------------------------------------------------------------
      * 4. Orchestrator Lambda Function
      * --------------------------------------------------------------------- */
+    // ...
+    /* ------------------------------------------------------------------------
+     * 4. Orchestrator Lambda Function
+     * --------------------------------------------------------------------- */
     this.orchestratorLambda = new lambdaNodejs.NodejsFunction(this, 'LambdaPulseOrchestratorFunction', {
       functionName: 'LambdaPulse-OrchestrateDataFetch', // Optional: define a specific name
       runtime: lambda.Runtime.NODEJS_LATEST,
-      entry: 'src/lambdas/processing-lambda/index.ts',
-      handler: 'handler',
-      timeout: Duration.minutes(1), // Can be shorter if just sending SQS messages
+      // Corrected entry path:
+      entry: path.join(__dirname, '..', 'src', 'lambdas', 'orchestrator-lambda', 'index.ts'),
+      handler: 'handler', // Ensure this handler exists in orchestrator-lambda/index.ts
+      timeout: Duration.minutes(1),
       memorySize: 256,
       environment: {
         TENANT_CONFIG_TABLE_NAME: props.tenantConfigTableName,
@@ -113,6 +118,7 @@ export class DataPipelineStack extends cdk.Stack {
         externalModules: ['@aws-sdk/*'], // Exclude AWS SDK v3 from bundle
       },
     });
+// ...
 
     // Grant Orchestrator Lambda permission to read from TenantConfigTable
     this.orchestratorLambda.addToRolePolicy(new iam.PolicyStatement({
